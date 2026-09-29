@@ -18,13 +18,13 @@ import crypto from "node:crypto";
  *       enabled: true
  *       config:
  *         api_key: ${ELEVENLABS_API_KEY}        # optional; this is the default
- *         default_model: eleven_multilingual_v2
+ *         default_model: eleven_v3             # plays [tags]; eleven_multilingual_v2 for longer texts
  *         output_format: mp3_44100_128
  */
 
 const API = "https://api.elevenlabs.io";
-/** One request's text: the multilingual models take up to 10k characters. */
-const TEXT_CAP = 10_000;
+/** One request's text: v3 takes up to 5k characters, the multilingual/flash models 10k. */
+const textCap = (model) => (model === "eleven_v3" ? 5_000 : 10_000);
 
 const EXT_BY_FORMAT = (f) => (f.startsWith("mp3") ? "mp3" : f.startsWith("pcm") ? "wav" : f.startsWith("opus") ? "opus" : "bin");
 
@@ -106,7 +106,7 @@ function srtFromAlignment(al) {
 }
 
 export default async function activate(ctx) {
-  const cfg = { api_key: "${ELEVENLABS_API_KEY}", default_model: "eleven_multilingual_v2", output_format: "mp3_44100_128", ...(ctx.config ?? {}) };
+  const cfg = { api_key: "${ELEVENLABS_API_KEY}", default_model: "eleven_v3", output_format: "mp3_44100_128", ...(ctx.config ?? {}) };
   const key = () => {
     const k = resolveRef(cfg.api_key);
     if (!k) throw new Error("ELEVENLABS_API_KEY is not set — add the ElevenLabs key under Settings → Integrations (or plugins.elevenlabs.config.api_key)");
@@ -220,7 +220,7 @@ export default async function activate(ctx) {
       "Voice a text with an ElevenLabs voice — PAID per character. The audio lands in this task's artifacts; with_timestamps also writes word timings (.json) and ready subtitles (.srt, tags removed) next to it, for captions on a video. Pick the voice with eleven_voices first; for long scripts voice a short sample, check it, then the rest.\n" +
       `Acting: with model_id "eleven_v3" the text may carry audio tags that steer the performance — ${V3_TAGS} — plus "…" for a pause. Use them sparingly and where a person would really do it (one or two per paragraph, never on every line); write the rest as natural spoken language, numbers and abbreviations the way they are said. Other models do not understand tags — they would be spoken or dropped, so leave them out there.`,
     schema: {
-      text: z.string().min(1).describe(`what to say, up to ${TEXT_CAP} characters per call`),
+      text: z.string().min(1).describe("what to say — up to 5000 characters a call on eleven_v3, 10000 on the others"),
       voice_id: z.string().describe("from eleven_voices"),
       model_id: z.string().optional().describe("from eleven_models; default from config"),
       language_code: z.string().optional().describe("ISO 639-1, e.g. 'ru' — only for models that take it"),
@@ -235,8 +235,9 @@ export default async function activate(ctx) {
     },
     handler: async (args, c) => {
       const t = String(args.text);
-      if (t.length > TEXT_CAP) return text(`error: ${t.length} characters — split the script into parts of up to ${TEXT_CAP} and voice them one by one`);
       const model = String(args.model_id ?? cfg.default_model);
+      const cap = textCap(model);
+      if (t.length > cap) return text(`error: ${t.length} characters — ${model} takes up to ${cap} a call; split the script and voice the parts one by one`);
       const format = String(cfg.output_format);
       const settings = Object.fromEntries(
         Object.entries({ stability: args.stability, similarity_boost: args.similarity_boost, style: args.style, speed: args.speed }).filter(([, v]) => v !== undefined),

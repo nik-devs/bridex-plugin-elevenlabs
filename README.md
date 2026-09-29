@@ -19,7 +19,7 @@ plugins:
   elevenlabs:
     config:
       api_key: ${ELEVENLABS_API_KEY}     # default
-      default_model: eleven_multilingual_v2
+      default_model: eleven_v3             # plays audio tags; eleven_multilingual_v2 takes longer texts
       output_format: mp3_44100_128        # mp3_44100_192, pcm_44100 (saved as .wav), opus_48000_128
 ```
 
@@ -29,12 +29,12 @@ plugins:
 |---|---|---|
 | `eleven_voices` | free | find a voice: the account's own, or the shared library by description ("warm british narrator"), language and gender |
 | `eleven_models` | free | speech models, their languages and text limits |
-| `eleven_speak` | **paid** (characters) | voice a text (up to 10k characters a call) into `artifacts/<task>/`; `with_timestamps` adds `.srt` subtitles and word timings |
+| `eleven_speak` | **paid** (characters) | voice a text (up to 5k characters a call on v3, 10k on the others) into `artifacts/<task>/`; `with_timestamps` adds `.srt` subtitles and word timings |
 | `eleven_sfx` | **paid** | a sound effect from a description, 0.5–30 s |
 
 ## Acting with v3 tags
 
-With `model_id: eleven_v3` the text can carry audio tags that steer the
+The default model, `eleven_v3`, lets the text carry audio tags that steer the
 performance: `[laughs] [laughs harder] [starts laughing] [wheezing]
 [whispers] [sighs] [exhales] [pauses] [sarcastic] [curious] [excited]
 [crying] [snorts] [mischievously] [sings] [woo] [applause] [clapping]

@@ -3,7 +3,8 @@
 # provenance and usage is recorded — in-process facilities a catalog "tool"
 # plugin (out-of-process, flat schemas) does not have.
 name: elevenlabs
-version: 0.1.1
+title: ElevenLabs
+version: 0.2.0
 kind: integration
 description: ElevenLabs for agents — voiceover in any voice, with word timings and subtitles, and sound effects. Outputs land in the task's artifacts.
 entry: index.mjs
@@ -22,8 +23,8 @@ config_schema:
     default_model:
       type: string
       title: Default model
-      default: eleven_multilingual_v2
-      description: Used when a call names none (see eleven_models)
+      default: eleven_v3
+      description: Used when a call names none (see eleven_models). eleven_v3 plays audio tags; eleven_multilingual_v2 takes longer texts
     output_format:
       type: string
       title: Audio format
