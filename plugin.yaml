@@ -1,0 +1,31 @@
+# elevenlabs — voiceover, sound effects and voice search for agents.
+# kind MUST stay "integration": outputs go into workspace artifacts with
+# provenance and usage is recorded — in-process facilities a catalog "tool"
+# plugin (out-of-process, flat schemas) does not have.
+name: elevenlabs
+version: 0.1.0
+kind: integration
+description: ElevenLabs for agents — voiceover in any voice, with word timings and subtitles, and sound effects. Outputs land in the task's artifacts.
+entry: index.mjs
+requires_env:
+  - ELEVENLABS_API_KEY   # its own key — the voice assistant's ELEVENLABS_PERSONA_KEY is separate
+config_schema:
+  type: object
+  properties:
+    api_key:
+      type: string
+      title: API key
+      secret: true
+      credential: ELEVENLABS_API_KEY
+      placeholder: "${ELEVENLABS_API_KEY}"
+      description: Leave empty to use the ElevenLabs key from Settings → Integrations
+    default_model:
+      type: string
+      title: Default model
+      default: eleven_multilingual_v2
+      description: Used when a call names none (see eleven_models)
+    output_format:
+      type: string
+      title: Audio format
+      enum: [mp3_44100_128, mp3_44100_192, pcm_44100, opus_48000_128]
+      default: mp3_44100_128

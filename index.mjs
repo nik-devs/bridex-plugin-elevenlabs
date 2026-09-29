@@ -1,0 +1,292 @@
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+/**
+ * ElevenLabs plugin: voiceover and sound effects for agents. Voices and models
+ * are browsed for free; speech and effects are paid and land in the task's
+ * artifacts with provenance (voice, model, settings). Speech can come with
+ * word timings and a ready .srt, so a video step can burn captions without a
+ * separate transcription pass.
+ *
+ * The key is its own ELEVENLABS_API_KEY credential (Settings → Integrations),
+ * read per call so it can be set without a restart. The dashboard voice
+ * assistant's ELEVENLABS_PERSONA_KEY is a different key on purpose.
+ *
+ *   plugins:
+ *     elevenlabs:
+ *       enabled: true
+ *       config:
+ *         api_key: ${ELEVENLABS_API_KEY}        # optional; this is the default
+ *         default_model: eleven_multilingual_v2
+ *         output_format: mp3_44100_128
+ */
+
+const API = "https://api.elevenlabs.io";
+/** One request's text: the multilingual models take up to 10k characters. */
+const TEXT_CAP = 10_000;
+
+const EXT_BY_FORMAT = (f) => (f.startsWith("mp3") ? "mp3" : f.startsWith("pcm") ? "wav" : f.startsWith("opus") ? "opus" : "bin");
+
+const resolveRef = (ref) => String(ref ?? "").replace(/\$\{([A-Z0-9_]+)\}/g, (_, n) => process.env[n] ?? "");
+const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "audio";
+
+/** Raw PCM from the API → a playable WAV (16-bit mono). */
+function wavFromPcm(pcm, sampleRate) {
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0);
+  h.writeUInt32LE(36 + pcm.length, 4);
+  h.write("WAVE", 8);
+  h.write("fmt ", 12);
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(sampleRate, 24);
+  h.writeUInt32LE(sampleRate * 2, 28);
+  h.writeUInt16LE(2, 32);
+  h.writeUInt16LE(16, 34);
+  h.write("data", 36);
+  h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]);
+}
+
+/** Character timings → words → subtitle cues (≤ 42 chars, ≤ 3.5 s, split at sentence ends). */
+function srtFromAlignment(al) {
+  const chars = al?.characters ?? [];
+  const starts = al?.character_start_times_seconds ?? [];
+  const ends = al?.character_end_times_seconds ?? [];
+  const words = [];
+  let cur = null;
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i];
+    if (/\s/.test(c)) {
+      if (cur) words.push(cur);
+      cur = null;
+      continue;
+    }
+    if (!cur) cur = { text: "", start: starts[i] ?? 0, end: ends[i] ?? 0 };
+    cur.text += c;
+    cur.end = ends[i] ?? cur.end;
+  }
+  if (cur) words.push(cur);
+  const cues = [];
+  let cue = null;
+  for (const w of words) {
+    const fits = cue && (cue.text + " " + w.text).length <= 42 && w.end - cue.start <= 3.5;
+    if (!fits) {
+      if (cue) cues.push(cue);
+      cue = { text: w.text, start: w.start, end: w.end };
+    } else {
+      cue.text += " " + w.text;
+      cue.end = w.end;
+    }
+    if (/[.!?…]$/.test(w.text)) {
+      cues.push(cue);
+      cue = null;
+    }
+  }
+  if (cue) cues.push(cue);
+  const ts = (s) => {
+    const ms = Math.max(0, Math.round(s * 1000));
+    const p = (n, l = 2) => String(n).padStart(l, "0");
+    return `${p(Math.floor(ms / 3_600_000))}:${p(Math.floor(ms / 60_000) % 60)}:${p(Math.floor(ms / 1000) % 60)},${p(ms % 1000, 3)}`;
+  };
+  return cues.map((c, i) => `${i + 1}\n${ts(c.start)} --> ${ts(c.end)}\n${c.text}\n`).join("\n");
+}
+
+export default async function activate(ctx) {
+  const cfg = { api_key: "${ELEVENLABS_API_KEY}", default_model: "eleven_multilingual_v2", output_format: "mp3_44100_128", ...(ctx.config ?? {}) };
+  const key = () => {
+    const k = resolveRef(cfg.api_key);
+    if (!k) throw new Error("ELEVENLABS_API_KEY is not set — add the ElevenLabs key under Settings → Integrations (or plugins.elevenlabs.config.api_key)");
+    return k;
+  };
+
+  /** One call to the API; an exhausted quota becomes one needs-a-person card, not a silent failure. */
+  async function call(pathname, init = {}, timeoutMs = 120_000) {
+    const res = await fetch(`${API}${pathname}`, {
+      ...init,
+      headers: { "xi-api-key": key(), ...(init.headers ?? {}) },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      const perm = /missing the permission (\w+)/.exec(body)?.[1];
+      if (perm) throw new Error(`the ElevenLabs key lacks the "${perm}" permission — enable it on the key in the ElevenLabs dashboard (API keys)`);
+      if (res.status === 401) throw new Error(`ElevenLabs rejected the key (401): ${body.slice(0, 200)}`);
+      if (res.status === 402 || /quota_exceeded|insufficient|credits/i.test(body))
+        ctx.billing?.outOfFunds?.({ provider: "ElevenLabs", what: "voiceover and sound effects (elevenlabs plugin)", detail: body.slice(0, 400) });
+      throw new Error(`ElevenLabs HTTP ${res.status}: ${body.slice(0, 300)}`);
+    }
+    return res;
+  }
+
+  /** Save one generated file into the task's artifacts, with how it was made. */
+  function save(c, name, buf, description, generation) {
+    const folder = c.taskId ?? "elevenlabs";
+    const rel = path.posix.join(folder, name);
+    const abs = path.join(ctx.paths.workspaceArtifacts(c.workspace), rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, buf);
+    ctx.artifacts.annotate(c.workspace, rel, { agent: c.agent, taskId: c.taskId, description: description.slice(0, 300), action: "generated", generation });
+    return rel;
+  }
+
+  const text = (t) => ({ content: [{ type: "text", text: t }] });
+  const json = (v) => text(JSON.stringify(v, null, 1));
+  const z = ctx.z;
+
+  ctx.registerTool({
+    name: "eleven_voices",
+    description:
+      "Find an ElevenLabs voice (free). source=mine: the account's own voices (cloned, professional, default); source=library: the shared library of thousands, searchable by description ('warm british narrator', 'energetic russian female'); all (default) searches both. Returns voice_id, labels (gender, age, accent, language, use case) and a preview URL. Any voice_id from here works in eleven_speak — never guess one.",
+    schema: {
+      search: z.string().optional().describe("a name or a description of the sound you want"),
+      source: z.enum(["all", "mine", "library"]).optional(),
+      language: z.string().optional().describe("library only: ISO 639-1, e.g. 'ru'"),
+      gender: z.enum(["male", "female", "neutral"]).optional().describe("library only"),
+      limit: z.number().int().min(1).max(30).optional(),
+    },
+    handler: async (args) => {
+      const source = args.source ?? "all";
+      const limit = args.limit ?? 12;
+      const out = { mine: [], library: [] };
+      if (source !== "library") {
+        const q = new URLSearchParams({ page_size: String(limit) });
+        if (args.search) q.set("search", String(args.search));
+        const r = await (await call(`/v2/voices?${q}`, {}, 30_000)).json();
+        out.mine = (r.voices ?? []).map((v) => ({
+          voice_id: v.voice_id,
+          name: v.name,
+          category: v.category,
+          labels: v.labels ?? {},
+          description: String(v.description ?? "").slice(0, 160),
+          preview_url: v.preview_url,
+        }));
+      }
+      if (source !== "mine") {
+        const q = new URLSearchParams({ page_size: String(limit) });
+        if (args.search) q.set("search", String(args.search));
+        if (args.language) q.set("language", String(args.language));
+        if (args.gender) q.set("gender", String(args.gender));
+        const r = await (await call(`/v1/shared-voices?${q}`, {}, 30_000)).json();
+        out.library = (r.voices ?? []).map((v) => ({
+          voice_id: v.voice_id,
+          name: v.name,
+          labels: Object.fromEntries(Object.entries({ gender: v.gender, age: v.age, accent: v.accent, language: v.language, use_case: v.use_case, descriptive: v.descriptive }).filter(([, x]) => x)),
+          description: String(v.description ?? "").slice(0, 160),
+          preview_url: v.preview_url,
+        }));
+      }
+      return json(out);
+    },
+  });
+
+  ctx.registerTool({
+    name: "eleven_models",
+    description: "ElevenLabs speech models (free): model_id, which languages each speaks, and how long a text it takes. The default comes from the plugin config.",
+    schema: {},
+    handler: async () => {
+      const r = await (await call("/v1/models", {}, 30_000)).json();
+      return json({
+        default: cfg.default_model,
+        models: (Array.isArray(r) ? r : [])
+          .filter((m) => m.can_do_text_to_speech)
+          .map((m) => ({
+            model_id: m.model_id,
+            name: m.name,
+            languages: (m.languages ?? []).map((l) => l.language_id),
+            max_characters: m.maximum_text_length_per_request,
+            description: String(m.description ?? "").slice(0, 160),
+          })),
+      });
+    },
+  });
+
+  ctx.registerTool({
+    name: "eleven_speak",
+    description:
+      "Voice a text with an ElevenLabs voice — PAID per character. The audio lands in this task's artifacts; with_timestamps also writes word timings (.json) and ready subtitles (.srt) next to it, for captions on a video. Pick the voice with eleven_voices first; for long scripts voice a short sample, check it, then the rest.",
+    schema: {
+      text: z.string().min(1).describe(`what to say, up to ${TEXT_CAP} characters per call`),
+      voice_id: z.string().describe("from eleven_voices"),
+      model_id: z.string().optional().describe("from eleven_models; default from config"),
+      language_code: z.string().optional().describe("ISO 639-1, e.g. 'ru' — only for models that take it"),
+      stability: z.number().min(0).max(1).optional().describe("lower = more expressive, higher = steadier"),
+      similarity_boost: z.number().min(0).max(1).optional(),
+      style: z.number().min(0).max(1).optional(),
+      speed: z.number().min(0.7).max(1.2).optional(),
+      seed: z.number().int().optional().describe("same seed + same inputs → the same take"),
+      with_timestamps: z.boolean().optional().describe("also save word timings and an .srt"),
+      name: z.string().max(40).optional().describe("file name stem, e.g. 'intro-ru'"),
+      note: z.string().max(200).optional().describe("what this is for (stored on the file)"),
+    },
+    handler: async (args, c) => {
+      const t = String(args.text);
+      if (t.length > TEXT_CAP) return text(`error: ${t.length} characters — split the script into parts of up to ${TEXT_CAP} and voice them one by one`);
+      const model = String(args.model_id ?? cfg.default_model);
+      const format = String(cfg.output_format);
+      const settings = Object.fromEntries(
+        Object.entries({ stability: args.stability, similarity_boost: args.similarity_boost, style: args.style, speed: args.speed }).filter(([, v]) => v !== undefined),
+      );
+      const body = {
+        text: t,
+        model_id: model,
+        ...(args.language_code ? { language_code: args.language_code } : {}),
+        ...(Object.keys(settings).length ? { voice_settings: settings } : {}),
+        ...(args.seed !== undefined ? { seed: args.seed } : {}),
+      };
+      const voice = encodeURIComponent(String(args.voice_id));
+      const init = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+      let audio;
+      let alignment = null;
+      if (args.with_timestamps) {
+        const r = await (await call(`/v1/text-to-speech/${voice}/with-timestamps?output_format=${format}`, init, 300_000)).json();
+        audio = Buffer.from(r.audio_base64 ?? "", "base64");
+        alignment = r.normalized_alignment ?? r.alignment ?? null;
+      } else {
+        audio = Buffer.from(await (await call(`/v1/text-to-speech/${voice}?output_format=${format}`, init, 300_000)).arrayBuffer());
+      }
+      if (format.startsWith("pcm")) audio = wavFromPcm(audio, Number(format.split("_")[1]) || 44100);
+      const stem = `${slugify(args.name ?? `tts-${args.voice_id}`)}-${crypto.randomBytes(3).toString("hex")}`;
+      const generation = { provider: "ElevenLabs", model, params: { voice_id: args.voice_id, ...body, text: t.length > 400 ? `${t.slice(0, 400)}…` : t } };
+      const note = String(args.note ?? t.slice(0, 120));
+      const files = [save(c, `${stem}.${EXT_BY_FORMAT(format)}`, audio, `ElevenLabs voiceover · ${note}`, generation)];
+      if (alignment) {
+        files.push(save(c, `${stem}.srt`, Buffer.from(srtFromAlignment(alignment)), `subtitles for ${stem}`, generation));
+        files.push(save(c, `${stem}.timings.json`, Buffer.from(JSON.stringify(alignment)), `word timings for ${stem}`, generation));
+      }
+      ctx.artifacts.mirror(c.workspace, files);
+      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model, costUsd: 0, units: t.length, unit: "chars" });
+      return json({ artifacts: files, characters: t.length, hint: "reference the audio as [media: artifacts/<path>]; listen to a sample before voicing the rest" });
+    },
+  });
+
+  ctx.registerTool({
+    name: "eleven_sfx",
+    description: "Generate a sound effect from a description — PAID. Lands in this task's artifacts. Describe the sound concretely (source, space, mood), e.g. 'soft whoosh of a UI card sliding in, short, clean'.",
+    schema: {
+      text: z.string().min(1).max(450).describe("what it should sound like"),
+      duration_s: z.number().min(0.5).max(30).optional().describe("omit to let the model choose"),
+      prompt_influence: z.number().min(0).max(1).optional().describe("higher = follows the text more literally"),
+      name: z.string().max(40).optional(),
+      note: z.string().max(200).optional(),
+    },
+    handler: async (args, c) => {
+      const body = {
+        text: String(args.text),
+        ...(args.duration_s !== undefined ? { duration_seconds: args.duration_s } : {}),
+        ...(args.prompt_influence !== undefined ? { prompt_influence: args.prompt_influence } : {}),
+      };
+      const res = await call(`/v1/sound-generation?output_format=mp3_44100_128`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 180_000);
+      const audio = Buffer.from(await res.arrayBuffer());
+      const stem = `${slugify(args.name ?? `sfx-${args.text}`)}-${crypto.randomBytes(3).toString("hex")}`;
+      const rel = save(c, `${stem}.mp3`, audio, `ElevenLabs sound effect · ${String(args.note ?? args.text).slice(0, 120)}`, { provider: "ElevenLabs", model: "sound-generation", params: body });
+      ctx.artifacts.mirror(c.workspace, [rel]);
+      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model: "sound-generation", costUsd: 0, units: 1, unit: "effects" });
+      return json({ artifacts: [rel] });
+    },
+  });
+
+  ctx.log.info("elevenlabs tools ready");
+}
