@@ -277,7 +277,7 @@ export default async function activate(ctx) {
 
   ctx.registerTool({
     name: "eleven_sfx",
-    description: "Generate a sound effect from a description — PAID. Lands in this task's artifacts. Describe the sound concretely (source, space, mood), e.g. 'soft whoosh of a UI card sliding in, short, clean'.",
+    description: "Generate a sound effect from a description — PAID, and a made effect is reusable. First look for one the team already has: artifact_search matches the prompt an effect was made from (\"mp3 whoosh\"), and the project or the wiki may keep a sound list; listen to a candidate with audio_understand. Generate only what is not there. Lands in this task's artifacts. Describe the sound concretely (source, space, mood), e.g. 'soft whoosh of a UI card sliding in, short, clean'.",
     schema: {
       text: z.string().min(1).max(450).describe("what it should sound like"),
       duration_s: z.number().min(0.5).max(30).optional().describe("omit to let the model choose"),
@@ -294,7 +294,7 @@ export default async function activate(ctx) {
       const res = await call(`/v1/sound-generation?output_format=mp3_44100_128`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 180_000);
       const audio = Buffer.from(await res.arrayBuffer());
       const stem = `${slugify(args.name ?? `sfx-${args.text}`)}-${crypto.randomBytes(3).toString("hex")}`;
-      const rel = save(c, `${stem}.mp3`, audio, `ElevenLabs sound effect · ${String(args.note ?? args.text).slice(0, 120)}`, { provider: "ElevenLabs", model: "sound-generation", params: body });
+      const rel = save(c, `${stem}.mp3`, audio, `Sound effect: ${String(args.text).slice(0, 220)}${args.note ? ` · ${String(args.note).slice(0, 70)}` : ""}`, { provider: "ElevenLabs", model: "sound-generation", params: body });
       ctx.artifacts.mirror(c.workspace, [rel]);
       ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model: "sound-generation", costUsd: 0, units: 1, unit: "effects" });
       return json({ artifacts: [rel] });
