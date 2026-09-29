@@ -50,15 +50,26 @@ function wavFromPcm(pcm, sampleRate) {
   return Buffer.concat([h, pcm]);
 }
 
-/** Character timings → words → subtitle cues (≤ 42 chars, ≤ 3.5 s, split at sentence ends). */
+/** Audio tags a v3 performance understands; they steer the voice and never belong in subtitles. */
+const V3_TAGS =
+  "[laughs] [laughs harder] [starts laughing] [wheezing] [whispers] [sighs] [exhales] [pauses] [sarcastic] [curious] [excited] [crying] [snorts] [mischievously] [sings] [woo] [applause] [clapping] [swallows] [gulps]";
+
+/** Character timings → words → subtitle cues (≤ 42 chars, ≤ 3.5 s, split at sentence ends); [tags] dropped. */
 function srtFromAlignment(al) {
   const chars = al?.characters ?? [];
   const starts = al?.character_start_times_seconds ?? [];
   const ends = al?.character_end_times_seconds ?? [];
   const words = [];
   let cur = null;
+  let inTag = false;
   for (let i = 0; i < chars.length; i++) {
     const c = chars[i];
+    // a v3 audio tag is performed, not said: keep it out of the captions
+    if (c === "[") inTag = true;
+    if (inTag) {
+      if (c === "]") inTag = false;
+      continue;
+    }
     if (/\s/.test(c)) {
       if (cur) words.push(cur);
       cur = null;
@@ -206,7 +217,8 @@ export default async function activate(ctx) {
   ctx.registerTool({
     name: "eleven_speak",
     description:
-      "Voice a text with an ElevenLabs voice — PAID per character. The audio lands in this task's artifacts; with_timestamps also writes word timings (.json) and ready subtitles (.srt) next to it, for captions on a video. Pick the voice with eleven_voices first; for long scripts voice a short sample, check it, then the rest.",
+      "Voice a text with an ElevenLabs voice — PAID per character. The audio lands in this task's artifacts; with_timestamps also writes word timings (.json) and ready subtitles (.srt, tags removed) next to it, for captions on a video. Pick the voice with eleven_voices first; for long scripts voice a short sample, check it, then the rest.\n" +
+      `Acting: with model_id "eleven_v3" the text may carry audio tags that steer the performance — ${V3_TAGS} — plus "…" for a pause. Use them sparingly and where a person would really do it (one or two per paragraph, never on every line); write the rest as natural spoken language, numbers and abbreviations the way they are said. Other models do not understand tags — they would be spoken or dropped, so leave them out there.`,
     schema: {
       text: z.string().min(1).describe(`what to say, up to ${TEXT_CAP} characters per call`),
       voice_id: z.string().describe("from eleven_voices"),

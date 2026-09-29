@@ -32,6 +32,16 @@ plugins:
 | `eleven_speak` | **paid** (characters) | voice a text (up to 10k characters a call) into `artifacts/<task>/`; `with_timestamps` adds `.srt` subtitles and word timings |
 | `eleven_sfx` | **paid** | a sound effect from a description, 0.5–30 s |
 
+## Acting with v3 tags
+
+With `model_id: eleven_v3` the text can carry audio tags that steer the
+performance: `[laughs] [laughs harder] [starts laughing] [wheezing]
+[whispers] [sighs] [exhales] [pauses] [sarcastic] [curious] [excited]
+[crying] [snorts] [mischievously] [sings] [woo] [applause] [clapping]
+[swallows] [gulps]`, plus `…` for a pause. Sparingly — one or two per
+paragraph, where a person would really do it. Other models do not understand
+tags. The `.srt` from `with_timestamps` leaves tags out.
+
 Usage is recorded in characters (and effects), not dollars: the price per
 character depends on the ElevenLabs plan. An exhausted quota raises one
 needs-a-person card in the Inbox.

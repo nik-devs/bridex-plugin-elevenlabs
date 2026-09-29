@@ -3,7 +3,7 @@
 # provenance and usage is recorded — in-process facilities a catalog "tool"
 # plugin (out-of-process, flat schemas) does not have.
 name: elevenlabs
-version: 0.1.0
+version: 0.1.1
 kind: integration
 description: ElevenLabs for agents — voiceover in any voice, with word timings and subtitles, and sound effects. Outputs land in the task's artifacts.
 entry: index.mjs
