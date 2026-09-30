@@ -3,7 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 /**
- * ElevenLabs plugin: voiceover and sound effects for agents. Voices and models
+ * ElevenLabs plugin: voiceover, sound effects and music for agents. Voices and models
  * are browsed for free; speech and effects are paid and land in the task's
  * artifacts with provenance (voice, model, settings). Speech can come with
  * word timings and a ready .srt, so a video step can burn captions without a
@@ -297,6 +297,37 @@ export default async function activate(ctx) {
       const rel = save(c, `${stem}.mp3`, audio, `Sound effect: ${String(args.text).slice(0, 220)}${args.note ? ` · ${String(args.note).slice(0, 70)}` : ""}`, { provider: "ElevenLabs", model: "sound-generation", params: body });
       ctx.artifacts.mirror(c.workspace, [rel]);
       ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model: "sound-generation", costUsd: 0, units: 1, unit: "effects" });
+      return json({ artifacts: [rel] });
+    },
+  });
+
+  ctx.registerTool({
+    name: "eleven_music",
+    description:
+      "Generate music from a description through ElevenLabs Music — PAID (priced per minute of audio), and a made track is reusable. First look for one the team already has: artifact_search matches the prompt a track was made from (\"music loop battle\"); listen to a candidate with audio_understand. Say genre, mood, tempo/BPM, instruments, what must NOT be there, and where it plays (a menu loop, a battle bed under sound effects). `instrumental: true` guarantees no vocals. For a game loop: ask for a steady groove with no intro or ending, generate a bit longer than the loop, and cut the seamless loop from the middle. Lands in this task's artifacts.",
+    schema: {
+      prompt: z.string().min(1).max(4100).describe("what the music should be — genre, mood, tempo, instruments, exclusions, use"),
+      duration_s: z.number().min(3).max(600).optional().describe("length in seconds (3–600); omit to let the model choose"),
+      instrumental: z.boolean().optional().describe("true = guaranteed no vocals"),
+      model: z.enum(["music_v1", "music_v2", "music_v2_5"]).optional().describe("omit for the account default; music_v2_5 is the newest"),
+      name: z.string().max(40).optional(),
+      note: z.string().max(200).optional(),
+    },
+    handler: async (args, c) => {
+      const body = {
+        prompt: String(args.prompt),
+        ...(args.duration_s !== undefined ? { music_length_ms: Math.round(Number(args.duration_s) * 1000) } : {}),
+        ...(args.instrumental !== undefined ? { force_instrumental: Boolean(args.instrumental) } : {}),
+        ...(args.model ? { model_id: String(args.model) } : {}),
+      };
+      const res = await call(`/v1/music?output_format=mp3_44100_192`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 600_000);
+      const audio = Buffer.from(await res.arrayBuffer());
+      // a random suffix: two tracks started together must never land on one file
+      const stem = `${slugify(args.name ?? `music-${args.prompt}`)}-${crypto.randomBytes(3).toString("hex")}`;
+      const model = body.model_id ?? "music";
+      const rel = save(c, `${stem}.mp3`, audio, `Music: ${String(args.prompt).slice(0, 220)}${args.note ? ` · ${String(args.note).slice(0, 70)}` : ""}`, { provider: "ElevenLabs", model, params: body });
+      ctx.artifacts.mirror(c.workspace, [rel]);
+      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model, costUsd: 0, units: Math.round((body.music_length_ms ?? 0) / 1000) || 1, unit: body.music_length_ms ? "seconds" : "tracks" });
       return json({ artifacts: [rel] });
     },
   });

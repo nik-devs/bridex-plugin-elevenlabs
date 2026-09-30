@@ -1,13 +1,18 @@
-# elevenlabs — voiceover, sound effects and voice search for agents.
+# elevenlabs — voiceover, sound effects, music and voice search for agents.
 # kind MUST stay "integration": outputs go into workspace artifacts with
 # provenance and usage is recorded — in-process facilities a catalog "tool"
 # plugin (out-of-process, flat schemas) does not have.
 name: elevenlabs
 title: ElevenLabs
-version: 0.2.1
+version: 0.3.0
 kind: integration
-description: ElevenLabs for agents — voiceover in any voice, with word timings and subtitles, and sound effects. Outputs land in the task's artifacts.
+description: ElevenLabs for agents — voiceover in any voice, with word timings and subtitles, sound effects and music. Outputs land in the task's artifacts.
 entry: index.mjs
+# the same ElevenLabs models through an aggregator (fal) are refused while this
+# plugin is active — one account, one bill, provenance kept
+direct_models:
+  - fal-ai/elevenlabs/
+  - elevenlabs/
 requires_env:
   - ELEVENLABS_API_KEY   # its own key — the voice assistant's ELEVENLABS_PERSONA_KEY is separate
 config_schema:
