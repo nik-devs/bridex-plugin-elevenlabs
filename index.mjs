@@ -332,5 +332,34 @@ export default async function activate(ctx) {
     },
   });
 
+  // dashboard balance: the subscription's credits for this period. A key needs
+  // «User → Read» for it; without that the tile says so instead of vanishing
+  if (typeof ctx.registerStat === "function") {
+    let cache = { at: 0, tiles: [] };
+    ctx.registerStat(async () => {
+      const k = resolveRef(cfg.api_key);
+      if (!k) return [];
+      if (Date.now() - cache.at < 300_000) return cache.tiles;
+      const res = await fetch("https://api.elevenlabs.io/v1/user/subscription", { headers: { "xi-api-key": k }, signal: AbortSignal.timeout(2500) });
+      let tiles;
+      if (res.status === 401 || res.status === 403) {
+        const body = await res.text();
+        tiles = [{ label: "ElevenLabs", value: "—", sub: /user_read/.test(body) ? "key needs User → Read" : "the key cannot read the plan", balance: null }];
+      } else {
+        if (!res.ok) throw new Error(`elevenlabs subscription HTTP ${res.status}`);
+        const s = await res.json();
+        const used = Number(s.character_count) || 0;
+        const limit = Number(s.character_limit) || 0;
+        const left = Math.max(0, limit - used);
+        const fmt = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
+        const days = s.next_character_count_reset_unix ? Math.max(0, Math.ceil((s.next_character_count_reset_unix * 1000 - Date.now()) / 86_400_000)) : null;
+        const share = limit > 0 ? left / limit : 0;
+        tiles = [{ label: "ElevenLabs", value: fmt(left), sub: `of ${fmt(limit)} credits${days !== null ? ` · resets in ${days}d` : ""}`, balance: share, low: share < 0.1 }];
+      }
+      cache = { at: Date.now(), tiles };
+      return tiles;
+    });
+  }
+
   ctx.log.info("elevenlabs tools ready");
 }

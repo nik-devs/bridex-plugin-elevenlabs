@@ -4,7 +4,7 @@
 # plugin (out-of-process, flat schemas) does not have.
 name: elevenlabs
 title: ElevenLabs
-version: 0.3.0
+version: 0.4.0
 kind: integration
 description: ElevenLabs for agents — voiceover in any voice, with word timings and subtitles, sound effects and music. Outputs land in the task's artifacts.
 entry: index.mjs
