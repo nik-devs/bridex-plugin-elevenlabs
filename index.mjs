@@ -132,6 +132,40 @@ export default async function activate(ctx) {
     return res;
   }
 
+  /** Credits used so far this period — null when the key may not read the subscription. */
+  async function creditsUsed() {
+    try {
+      const r = await fetch(`${API}/v1/user/subscription`, { headers: { "xi-api-key": key() }, signal: AbortSignal.timeout(5000) });
+      if (!r.ok) return null;
+      const j = await r.json();
+      return typeof j.character_count === "number" ? j.character_count : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * What a generation cost, in ElevenLabs credits: the `character-cost` header
+   * when the response carries it, else the subscription counter before vs after
+   * (another generation on the same key at the same time inflates that — it is
+   * marked as such). Unknown stays unknown: no estimate from a price list.
+   */
+  function spentCredits(res, before, after) {
+    const h = res.headers.get("character-cost");
+    if (h !== null && h.trim() !== "" && Number.isFinite(Number(h))) return { credits: Number(h), credits_source: "response header" };
+    if (before !== null && after !== null && after >= before) return { credits: after - before, credits_source: "balance difference (inflated if the key was used in parallel)" };
+    return null;
+  }
+
+  /** Run one paid call and learn its cost in credits. */
+  async function paidCall(pathname, init, timeoutMs) {
+    const before = await creditsUsed();
+    const res = await call(pathname, init, timeoutMs);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const spent = spentCredits(res, before, res.headers.get("character-cost") === null ? await creditsUsed() : null);
+    return { buf, spent };
+  }
+
   /** Save one generated file into the task's artifacts, with how it was made. */
   function save(c, name, buf, description, generation) {
     const folder = c.taskId ?? "elevenlabs";
@@ -253,16 +287,17 @@ export default async function activate(ctx) {
       const init = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
       let audio;
       let alignment = null;
+      const { buf, spent } = await paidCall(`/v1/text-to-speech/${voice}${args.with_timestamps ? "/with-timestamps" : ""}?output_format=${format}`, init, 300_000);
       if (args.with_timestamps) {
-        const r = await (await call(`/v1/text-to-speech/${voice}/with-timestamps?output_format=${format}`, init, 300_000)).json();
+        const r = JSON.parse(buf.toString("utf8"));
         audio = Buffer.from(r.audio_base64 ?? "", "base64");
         alignment = r.normalized_alignment ?? r.alignment ?? null;
       } else {
-        audio = Buffer.from(await (await call(`/v1/text-to-speech/${voice}?output_format=${format}`, init, 300_000)).arrayBuffer());
+        audio = buf;
       }
       if (format.startsWith("pcm")) audio = wavFromPcm(audio, Number(format.split("_")[1]) || 44100);
       const stem = `${slugify(args.name ?? `tts-${args.voice_id}`)}-${crypto.randomBytes(3).toString("hex")}`;
-      const generation = { provider: "ElevenLabs", model, params: { voice_id: args.voice_id, ...body, text: t.length > 400 ? `${t.slice(0, 400)}…` : t } };
+      const generation = { provider: "ElevenLabs", model, params: { voice_id: args.voice_id, ...body, text: t.length > 400 ? `${t.slice(0, 400)}…` : t }, ...(spent ?? {}) };
       const note = String(args.note ?? t.slice(0, 120));
       const files = [save(c, `${stem}.${EXT_BY_FORMAT(format)}`, audio, `ElevenLabs voiceover · ${note}`, generation)];
       if (alignment) {
@@ -270,8 +305,8 @@ export default async function activate(ctx) {
         files.push(save(c, `${stem}.timings.json`, Buffer.from(JSON.stringify(alignment)), `word timings for ${stem}`, generation));
       }
       ctx.artifacts.mirror(c.workspace, files);
-      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model, costUsd: 0, units: t.length, unit: "chars" });
-      return json({ artifacts: files, characters: t.length, hint: "reference the audio as [media: artifacts/<path>]; listen to a sample before voicing the rest" });
+      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model, costUsd: 0, ...(spent ? { units: spent.credits, unit: "credits" } : { units: t.length, unit: "chars" }) });
+      return json({ artifacts: files, characters: t.length, ...(spent ?? {}), hint: "reference the audio as [media: artifacts/<path>]; listen to a sample before voicing the rest" });
     },
   });
 
@@ -291,13 +326,12 @@ export default async function activate(ctx) {
         ...(args.duration_s !== undefined ? { duration_seconds: args.duration_s } : {}),
         ...(args.prompt_influence !== undefined ? { prompt_influence: args.prompt_influence } : {}),
       };
-      const res = await call(`/v1/sound-generation?output_format=mp3_44100_128`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 180_000);
-      const audio = Buffer.from(await res.arrayBuffer());
+      const { buf: audio, spent } = await paidCall(`/v1/sound-generation?output_format=mp3_44100_128`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 180_000);
       const stem = `${slugify(args.name ?? `sfx-${args.text}`)}-${crypto.randomBytes(3).toString("hex")}`;
-      const rel = save(c, `${stem}.mp3`, audio, `Sound effect: ${String(args.text).slice(0, 220)}${args.note ? ` · ${String(args.note).slice(0, 70)}` : ""}`, { provider: "ElevenLabs", model: "sound-generation", params: body });
+      const rel = save(c, `${stem}.mp3`, audio, `Sound effect: ${String(args.text).slice(0, 220)}${args.note ? ` · ${String(args.note).slice(0, 70)}` : ""}`, { provider: "ElevenLabs", model: "sound-generation", params: body, ...(spent ?? {}) });
       ctx.artifacts.mirror(c.workspace, [rel]);
-      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model: "sound-generation", costUsd: 0, units: 1, unit: "effects" });
-      return json({ artifacts: [rel] });
+      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model: "sound-generation", costUsd: 0, ...(spent ? { units: spent.credits, unit: "credits" } : { units: 1, unit: "effects" }) });
+      return json({ artifacts: [rel], ...(spent ?? { credits: null, credits_source: "unknown — the response carried no cost and the key cannot read the balance" }) });
     },
   });
 
@@ -320,15 +354,14 @@ export default async function activate(ctx) {
         ...(args.instrumental !== undefined ? { force_instrumental: Boolean(args.instrumental) } : {}),
         ...(args.model ? { model_id: String(args.model) } : {}),
       };
-      const res = await call(`/v1/music?output_format=mp3_44100_192`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 600_000);
-      const audio = Buffer.from(await res.arrayBuffer());
+      const { buf: audio, spent } = await paidCall(`/v1/music?output_format=mp3_44100_192`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 600_000);
       // a random suffix: two tracks started together must never land on one file
       const stem = `${slugify(args.name ?? `music-${args.prompt}`)}-${crypto.randomBytes(3).toString("hex")}`;
       const model = body.model_id ?? "music";
-      const rel = save(c, `${stem}.mp3`, audio, `Music: ${String(args.prompt).slice(0, 220)}${args.note ? ` · ${String(args.note).slice(0, 70)}` : ""}`, { provider: "ElevenLabs", model, params: body });
+      const rel = save(c, `${stem}.mp3`, audio, `Music: ${String(args.prompt).slice(0, 220)}${args.note ? ` · ${String(args.note).slice(0, 70)}` : ""}`, { provider: "ElevenLabs", model, params: body, ...(spent ?? {}) });
       ctx.artifacts.mirror(c.workspace, [rel]);
-      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model, costUsd: 0, units: Math.round((body.music_length_ms ?? 0) / 1000) || 1, unit: body.music_length_ms ? "seconds" : "tracks" });
-      return json({ artifacts: [rel] });
+      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model, costUsd: 0, ...(spent ? { units: spent.credits, unit: "credits" } : { units: Math.round((body.music_length_ms ?? 0) / 1000) || 1, unit: body.music_length_ms ? "seconds" : "tracks" }) });
+      return json({ artifacts: [rel], ...(spent ?? { credits: null, credits_source: "unknown — the response carried no cost and the key cannot read the balance" }) });
     },
   });
 
