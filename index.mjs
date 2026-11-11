@@ -105,6 +105,59 @@ function srtFromAlignment(al) {
   return cues.map((c, i) => `${i + 1}\n${ts(c.start)} --> ${ts(c.end)}\n${c.text}\n`).join("\n");
 }
 
+/** Scribe's timed words → subtitle cues (≤ 42 chars, ≤ 3.5 s, split at sentence ends); spacing and sound tags skipped. */
+function srtFromWords(words) {
+  const cues = [];
+  let cue = null;
+  for (const w of words) {
+    if (w.type && w.type !== "word") continue;
+    const t = String(w.text ?? "").trim();
+    if (!t) continue;
+    if (cue && (cue.text + " " + t).length <= 42 && w.end - cue.start <= 3.5) {
+      cue.text += " " + t;
+      cue.end = w.end;
+    } else {
+      if (cue) cues.push(cue);
+      cue = { text: t, start: w.start ?? 0, end: w.end ?? 0 };
+    }
+    if (/[.!?…]$/.test(t)) {
+      cues.push(cue);
+      cue = null;
+    }
+  }
+  if (cue) cues.push(cue);
+  const ts = (s) => {
+    const ms = Math.max(0, Math.round(s * 1000));
+    const p = (n, l = 2) => String(n).padStart(l, "0");
+    return `${p(Math.floor(ms / 3_600_000))}:${p(Math.floor(ms / 60_000) % 60)}:${p(Math.floor(ms / 1000) % 60)},${p(ms % 1000, 3)}`;
+  };
+  return cues.map((c, i) => `${i + 1}\n${ts(c.start)} --> ${ts(c.end)}\n${c.text}\n`).join("\n");
+}
+
+/**
+ * The parts of the API eleven_run may call: everything that makes or shapes
+ * audio and voices. Account administration (keys, workspace, members, service
+ * accounts, the conversational-agents platform) stays out, and so does every
+ * DELETE — an agent has no business removing the account's voices or history.
+ */
+const OPEN = [
+  "/v1/speech-to-text", "/v1/forced-alignment", "/v1/audio-isolation", "/v1/voice-changer", "/v1/text-to-speech", "/v1/text-to-dialogue",
+  "/v1/text-to-voice", "/v1/sound-generation", "/v1/music", "/v1/dubbing", "/v1/voices", "/v2/voices", "/v1/shared-voices", "/v1/similar-voices",
+  "/v1/models", "/v1/history", "/v1/pronunciation-dictionaries", "/v1/studio", "/v1/audio-native", "/v1/audio-effects",
+];
+const openTo = (method, p) => method !== "delete" && OPEN.some((o) => p === o || p.startsWith(`${o}/`));
+const FILE_CAP = 200 * 1024 * 1024;
+const MIME_BY_EXT = {
+  mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", ogg: "audio/ogg", opus: "audio/opus", flac: "audio/flac", aac: "audio/aac", webm: "video/webm",
+  mp4: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp",
+  txt: "text/plain", srt: "text/plain", json: "application/json", pls: "application/pls+xml",
+};
+const EXT_BY_MIME = {
+  "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/wav": "wav", "audio/x-wav": "wav", "audio/ogg": "ogg", "audio/opus": "opus", "audio/flac": "flac",
+  "audio/aac": "aac", "audio/mp4": "m4a", "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "application/zip": "zip",
+  "image/png": "png", "image/jpeg": "jpg", "text/plain": "txt", "text/srt": "srt", "text/vtt": "vtt", "application/pls+xml": "pls",
+};
+
 export default async function activate(ctx) {
   const cfg = { api_key: "${ELEVENLABS_API_KEY}", default_model: "eleven_v3", output_format: "mp3_44100_128", ...(ctx.config ?? {}) };
   const key = () => {
@@ -163,7 +216,7 @@ export default async function activate(ctx) {
     const res = await call(pathname, init, timeoutMs);
     const buf = Buffer.from(await res.arrayBuffer());
     const spent = spentCredits(res, before, res.headers.get("character-cost") === null ? await creditsUsed() : null);
-    return { buf, spent };
+    return { buf, spent, type: (res.headers.get("content-type") ?? "").split(";")[0].trim() };
   }
 
   /** Save one generated file into the task's artifacts, with how it was made. */
@@ -362,6 +415,267 @@ export default async function activate(ctx) {
       ctx.artifacts.mirror(c.workspace, [rel]);
       ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model, costUsd: 0, ...(spent ? { units: spent.credits, unit: "credits" } : { units: Math.round((body.music_length_ms ?? 0) / 1000) || 1, unit: body.music_length_ms ? "seconds" : "tracks" }) });
       return json({ artifacts: [rel], ...(spent ?? { credits: null, credits_source: "unknown — the response carried no cost and the key cannot read the balance" }) });
+    },
+  });
+
+  /** Local path (artifacts/… or the workdir) → absolute, jailed to this workspace. */
+  function resolveLocal(ws, p) {
+    const art = ctx.paths.workspaceArtifacts(ws);
+    const work = ctx.paths.workspaceWorkdir(ws);
+    const abs = p.includes("artifacts/") ? path.join(art, p.slice(p.indexOf("artifacts/") + "artifacts/".length)) : path.resolve(work, p);
+    const inside = (root) => abs === root || abs.startsWith(root + path.sep);
+    if (!inside(art) && !inside(work)) throw new Error(`path is outside your workspace: ${p}`);
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`file not found: ${p}`);
+    if (fs.statSync(abs).size > FILE_CAP) throw new Error(`${p} is over ${FILE_CAP / 1e6}MB`);
+    return abs;
+  }
+
+  /** A file for a form field: a workspace file, or a URL fetched here. */
+  async function fileBlob(ws, ref) {
+    if (/^https?:\/\//i.test(ref)) {
+      const res = await fetch(ref, { signal: AbortSignal.timeout(300_000) });
+      if (!res.ok) throw new Error(`could not download ${ref}: ${res.status}`);
+      const name = path.posix.basename(new URL(ref).pathname) || "file";
+      const type = (res.headers.get("content-type") ?? "").split(";")[0].trim() || MIME_BY_EXT[path.extname(name).slice(1).toLowerCase()] || "application/octet-stream";
+      return { blob: new Blob([await res.arrayBuffer()], { type }), name };
+    }
+    const abs = resolveLocal(ws, ref);
+    return { blob: new Blob([fs.readFileSync(abs)], { type: MIME_BY_EXT[path.extname(abs).slice(1).toLowerCase()] ?? "application/octet-stream" }), name: path.basename(abs) };
+  }
+
+  /** Trim a JSON answer for the reply: keep the structure, cut long strings and lists. */
+  function compact(v, depth = 0) {
+    if (typeof v === "string") return v.length > 600 ? `${v.slice(0, 600)}…(${v.length} chars)` : v;
+    if (Array.isArray(v)) return depth > 5 ? `[${v.length} items]` : [...v.slice(0, 30).map((x) => compact(x, depth + 1)), ...(v.length > 30 ? [`…${v.length - 30} more`] : [])];
+    if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, compact(x, depth + 1)]));
+    return v;
+  }
+
+  ctx.registerTool({
+    name: "eleven_transcribe",
+    description:
+      "Transcribe speech with ElevenLabs Scribe — PAID per minute of audio. Takes audio or video (an artifacts/… path, a workspace file or a URL); returns the text and saves the full answer (.json: every word with its time and, with speakers, who said it) and ready subtitles (.srt) into this task's artifacts. Give `keyterms` for names and brand words that must come out right.",
+    schema: {
+      file: z.string().describe("artifacts/… path, a path in your workspace, or an http(s) URL"),
+      language: z.string().optional().describe("ISO 639-1/3 code of the speech; omit to detect it"),
+      speakers: z.number().int().min(1).max(32).optional().describe("at most how many people speak — labels who says what"),
+      diarize: z.boolean().optional().describe("label who speaks without saying how many"),
+      audio_events: z.boolean().optional().describe("tag (laughter), (music)… in the text; default true"),
+      keyterms: z.array(z.string()).max(100).optional().describe("names and terms to get right"),
+      verbatim: z.boolean().optional().describe("false drops filler words and false starts"),
+      model_id: z.string().optional().describe("default scribe_v2"),
+      name: z.string().max(40).optional().describe("file name stem"),
+    },
+    handler: async (args, c) => {
+      const src = String(args.file);
+      const fd = new FormData();
+      fd.append("model_id", String(args.model_id ?? "scribe_v2"));
+      if (/^https?:\/\//i.test(src)) fd.append("source_url", src);
+      else {
+        const f = await fileBlob(c.workspace, src);
+        fd.append("file", f.blob, f.name);
+      }
+      fd.append("timestamps_granularity", "word");
+      if (args.language) fd.append("language_code", String(args.language));
+      if (args.speakers) fd.append("num_speakers", String(args.speakers));
+      if (args.speakers || args.diarize) fd.append("diarize", "true");
+      if (args.audio_events !== undefined) fd.append("tag_audio_events", String(Boolean(args.audio_events)));
+      if (args.verbatim === false) fd.append("no_verbatim", "true");
+      for (const k of args.keyterms ?? []) fd.append("keyterms", String(k));
+      const { buf, spent } = await paidCall("/v1/speech-to-text", { method: "POST", body: fd }, 900_000);
+      const r = JSON.parse(buf.toString("utf8"));
+      const stem = `${slugify(args.name ?? `transcript-${path.basename(src).replace(/\.[^.]+$/, "")}`)}-${crypto.randomBytes(3).toString("hex")}`;
+      const generation = { provider: "ElevenLabs", model: String(args.model_id ?? "scribe_v2"), params: { source: src, ...(args.language ? { language_code: args.language } : {}), ...(args.speakers ? { num_speakers: args.speakers } : {}) }, ...(spent ?? {}) };
+      const files = [save(c, `${stem}.json`, buf, `Transcript of ${src} (Scribe, word timings)`, generation)];
+      if (r.words?.length) files.push(save(c, `${stem}.srt`, Buffer.from(srtFromWords(r.words)), `Subtitles for ${src}`, generation));
+      ctx.artifacts.mirror(c.workspace, files);
+      ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model: generation.model, costUsd: 0, ...(spent ? { units: spent.credits, unit: "credits" } : {}) });
+      const t = String(r.text ?? "");
+      return json({
+        text: t.length > 20_000 ? `${t.slice(0, 20_000)}…(the whole transcript is in ${files[0]})` : t,
+        language: r.language_code,
+        ...(new Set((r.words ?? []).map((w) => w.speaker_id).filter(Boolean)).size > 1 ? { speakers: [...new Set(r.words.map((w) => w.speaker_id).filter(Boolean))] } : {}),
+        artifacts: files,
+        ...(spent ?? {}),
+      });
+    },
+  });
+
+  // the API's own description, read live: new endpoints are callable the day they ship
+  let spec = { at: 0, doc: null };
+  async function apiSpec() {
+    if (spec.doc && Date.now() - spec.at < 12 * 3_600_000) return spec.doc;
+    const res = await fetch(`${API}/openapi.json`, { signal: AbortSignal.timeout(60_000) });
+    if (!res.ok) throw new Error(`ElevenLabs API description unavailable (${res.status})`);
+    spec = { at: Date.now(), doc: await res.json() };
+    return spec.doc;
+  }
+  const parseOp = (s) => {
+    const m = /^\s*(GET|POST|PATCH|PUT|DELETE)\s+(\/\S+)\s*$/i.exec(String(s));
+    return m ? { method: m[1].toLowerCase(), path: m[2] } : null;
+  };
+  /** One schema, $refs resolved and trimmed to what a call needs: types, enums, defaults, short descriptions. */
+  function shape(doc, s, depth = 0) {
+    if (!s || typeof s !== "object" || depth > 6) return s;
+    if (s.$ref) return shape(doc, doc.components?.schemas?.[s.$ref.split("/").pop()], depth + 1);
+    const alt = s.anyOf ?? s.oneOf;
+    if (alt) {
+      const real = alt.filter((x) => x.type !== "null");
+      return real.length === 1 ? { ...shape(doc, real[0], depth + 1), ...(s.description ? { description: String(s.description).slice(0, 200) } : {}) } : { anyOf: real.map((x) => shape(doc, x, depth + 1)) };
+    }
+    const out = {};
+    if (s.type) out.type = s.format === "binary" ? "file" : s.type;
+    if (s.enum) out.enum = s.enum;
+    if (s.default !== undefined) out.default = s.default;
+    if (s.description) out.description = String(s.description).replace(/\s+/g, " ").slice(0, 200);
+    if (s.properties) out.properties = Object.fromEntries(Object.entries(s.properties).map(([k, v]) => [k, shape(doc, v, depth + 1)]));
+    if (s.required) out.required = s.required;
+    if (s.items) out.items = shape(doc, s.items, depth + 1);
+    return out;
+  }
+
+  ctx.registerTool({
+    name: "eleven_api",
+    description:
+      "Everything else ElevenLabs can do, read from their live API description (free): voice isolation, forced alignment of a script to audio, voice changer, voice design and cloning, multi-voice dialogue, dubbing, music composition plans, stem separation and video-to-music, pronunciation dictionaries, Studio projects. Without `operation` it lists operations (filter with `query`); with one it shows that operation's parameters and body. Call it with eleven_run.",
+    schema: {
+      query: z.string().optional().describe("words matched against the path and summary, e.g. 'isolation', 'dubbing', 'stem'"),
+      operation: z.string().optional().describe('one operation exactly as listed, e.g. "POST /v1/audio-isolation"'),
+    },
+    handler: async (args) => {
+      const doc = await apiSpec();
+      if (args.operation) {
+        const want = parseOp(args.operation);
+        const op = want && doc.paths?.[want.path]?.[want.method];
+        if (!op || !openTo(want.method, want.path)) return text(`error: no such operation open to agents: ${args.operation} — list them with eleven_api`);
+        const params = (op.parameters ?? [])
+          .map((p) => (p.$ref ? doc.components?.parameters?.[p.$ref.split("/").pop()] : p))
+          .filter((p) => p && p.in !== "header" && p.name !== "xi-api-key")
+          .map((p) => ({ name: p.name, in: p.in, ...(p.required ? { required: true } : {}), ...shape(doc, p.schema), ...(p.description ? { description: String(p.description).replace(/\s+/g, " ").slice(0, 200) } : {}) }));
+        const content = op.requestBody?.content ?? {};
+        const kind = content["multipart/form-data"] ? "multipart/form-data" : content["application/json"] ? "application/json" : null;
+        const out = JSON.stringify({
+          operation: `${want.method.toUpperCase()} ${want.path}`,
+          summary: op.summary,
+          description: String(op.description ?? "").replace(/\s+/g, " ").slice(0, 600),
+          parameters: params,
+          ...(kind ? { body: { content_type: kind, note: kind === "multipart/form-data" ? "fields of type file go in eleven_run's `files`, the rest in `body`" : undefined, schema: shape(doc, content[kind].schema) } } : {}),
+          returns: Object.keys(op.responses?.["200"]?.content ?? {}),
+        }, null, 1);
+        return text(out.length > 14_000 ? `${out.slice(0, 14_000)}\n…(truncated)` : out);
+      }
+      const words = String(args.query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+      const ops = [];
+      for (const [p, methods] of Object.entries(doc.paths ?? {}))
+        for (const [m, op] of Object.entries(methods)) {
+          if (!["get", "post", "patch", "put"].includes(m) || !openTo(m, p) || op.deprecated) continue;
+          const line = `${m.toUpperCase()} ${p}`;
+          if (words.every((w) => `${line} ${op.summary ?? ""}`.toLowerCase().includes(w))) ops.push({ operation: line, summary: op.summary });
+        }
+      return json({ total: ops.length, operations: ops.slice(0, 60), ...(ops.length > 60 ? { more: `${ops.length - 60} more — narrow with query` } : {}) });
+    },
+  });
+
+  ctx.registerTool({
+    name: "eleven_run",
+    description:
+      "Call one ElevenLabs operation from eleven_api — read its parameters there first. Most calls that make audio are PAID in credits; the cost comes back with the result. Audio, video and other files it returns land in this task's artifacts; JSON comes back as is (long jobs like dubbing return an id — check them with the GET operation later). File fields of a form (audio to isolate, samples to clone) take artifacts/… paths or URLs in `files`.",
+    schema: {
+      operation: z.string().describe('exactly as eleven_api lists it, e.g. "POST /v1/audio-isolation"'),
+      path: z.record(z.string(), z.string()).optional().describe("values for the {placeholders} in the path, e.g. {voice_id: '…'}"),
+      query: z.record(z.string(), z.unknown()).optional().describe("query parameters, e.g. {output_format: 'mp3_44100_128'}"),
+      body: z.record(z.string(), z.unknown()).optional().describe("body fields, JSON or form as eleven_api says"),
+      files: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional().describe("form fields that take files: field → artifacts/… path or URL, or a list of them"),
+      name: z.string().max(40).optional().describe("file name stem for what it returns"),
+      note: z.string().max(200).optional().describe("what this is for (stored on the files)"),
+    },
+    handler: async (args, c) => {
+      const want = parseOp(args.operation);
+      if (!want) return text('error: operation must look like "POST /v1/audio-isolation" — list them with eleven_api');
+      if (!openTo(want.method, want.path)) return text(`error: ${args.operation} is not open to agents (account administration and deletions stay with the owner)`);
+      const doc = await apiSpec();
+      const op = doc.paths?.[want.path]?.[want.method];
+      if (!op) return text(`error: no such operation: ${args.operation} — list them with eleven_api`);
+      const missing = [];
+      const url = want.path.replace(/\{([^}]+)\}/g, (_, k) => {
+        const v = args.path?.[k];
+        if (v === undefined) missing.push(k);
+        return encodeURIComponent(String(v ?? ""));
+      });
+      if (missing.length) return text(`error: the path needs ${missing.join(", ")} in \`path\``);
+      const q = new URLSearchParams();
+      for (const [k, v] of Object.entries(args.query ?? {})) for (const x of Array.isArray(v) ? v : [v]) if (x !== undefined && x !== null) q.append(k, String(x));
+      const content = op.requestBody?.content ?? {};
+      const init = { method: want.method.toUpperCase() };
+      if (content["multipart/form-data"] && (args.files || !content["application/json"])) {
+        const fd = new FormData();
+        for (const [k, v] of Object.entries(args.body ?? {}))
+          for (const x of Array.isArray(v) ? v : [v]) if (x !== undefined && x !== null) fd.append(k, typeof x === "object" ? JSON.stringify(x) : String(x));
+        for (const [k, refs] of Object.entries(args.files ?? {}))
+          for (const ref of Array.isArray(refs) ? refs : [refs]) {
+            const f = await fileBlob(c.workspace, String(ref));
+            fd.append(k, f.blob, f.name);
+          }
+        init.body = fd;
+      } else if (args.body) {
+        init.headers = { "Content-Type": "application/json" };
+        init.body = JSON.stringify(args.body);
+      }
+      const target = `${url}${q.size ? `?${q}` : ""}`;
+      let buf;
+      let spent = null;
+      let type;
+      if (want.method === "get") {
+        const res = await call(target, init, 300_000);
+        buf = Buffer.from(await res.arrayBuffer());
+        type = (res.headers.get("content-type") ?? "").split(";")[0].trim();
+      } else ({ buf, spent, type } = await paidCall(target, init, 900_000));
+      const label = `${want.method.toUpperCase()} ${want.path}`;
+      const stem = `${slugify(args.name ?? want.path.split("/").filter((x) => x && !x.startsWith("{")).slice(1).join("-"))}-${crypto.randomBytes(3).toString("hex")}`;
+      const generation = { provider: "ElevenLabs", model: label, params: { ...(args.path ?? {}), ...(args.query ?? {}), ...(args.body ?? {}), ...(args.files ? { files: args.files } : {}) }, ...(spent ?? {}) };
+      const note = String(args.note ?? label);
+      const files = [];
+      let result;
+      if (/json/.test(type)) {
+        result = JSON.parse(buf.toString("utf8") || "null");
+        // audio inside the JSON (…_base64): into a file, its place in the answer taken by the path
+        const fmt = String(args.query?.output_format ?? "mp3");
+        const lift = (v, depth = 0) => {
+          if (!v || typeof v !== "object" || depth > 4) return v;
+          for (const [k, x] of Object.entries(v)) {
+            if (typeof x === "string" && /base64$/i.test(k) && x.length > 200) {
+              let audio = Buffer.from(x, "base64");
+              if (fmt.startsWith("pcm")) audio = wavFromPcm(audio, Number(fmt.split("_")[1]) || 44100);
+              const rel = save(c, `${stem}${files.length ? `-${files.length + 1}` : ""}.${EXT_BY_FORMAT(fmt) === "bin" ? "mp3" : EXT_BY_FORMAT(fmt)}`, audio, `ElevenLabs ${label} · ${note}`, generation);
+              files.push(rel);
+              v[k] = `saved to artifacts/${rel}`;
+            } else lift(x, depth + 1);
+          }
+          return v;
+        };
+        lift(result);
+      } else if (/^text\//.test(type) && !/srt|vtt/.test(type)) {
+        result = buf.toString("utf8").slice(0, 20_000);
+      } else if (buf.length) {
+        let out = buf;
+        let ext = EXT_BY_MIME[type];
+        if (!ext && type === "application/octet-stream") {
+          const fmt = String(args.query?.output_format ?? "");
+          if (fmt.startsWith("pcm")) {
+            out = wavFromPcm(buf, Number(fmt.split("_")[1]) || 44100);
+            ext = "wav";
+          } else ext = fmt ? EXT_BY_FORMAT(fmt) : "bin";
+        }
+        files.push(save(c, `${stem}.${ext ?? "bin"}`, out, `ElevenLabs ${label} · ${note}`, generation));
+      }
+      if (files.length) ctx.artifacts.mirror(c.workspace, files);
+      if (want.method !== "get") ctx.usage.record({ workspace: c.workspace, agent: c.agent, taskId: c.taskId, kind: "elevenlabs", model: label, costUsd: 0, ...(spent ? { units: spent.credits, unit: "credits" } : {}) });
+      return json({
+        ...(files.length ? { artifacts: files } : {}),
+        ...(result !== undefined ? { result: compact(result) } : {}),
+        ...(spent ?? {}),
+        ...(files.some((f) => /\.(mp3|wav|ogg|opus|flac|m4a)$/.test(f)) ? { hint: "listen with audio_understand before handing it over; reference it as [media: artifacts/<path>]" } : {}),
+      });
     },
   });
 
